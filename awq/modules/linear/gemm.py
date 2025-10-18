@@ -1,29 +1,79 @@
-import torch
-import warnings
-import torch.nn as nn
-from torch.autograd import Function
-from awq.utils.module import try_import
-from awq.utils.utils import get_best_device
-from awq.utils.packing_utils import dequantize_gemm
+"""
+AWQ GEMM量化线性层实现
 
-# NOTE: We check if awq_ext or triton is available. awq_ext will be preferred if both are installed.
+该模块实现了GEMM（General Matrix-Matrix Multiplication）版本的AWQ量化线性层，
+专门针对大批量矩阵-矩阵乘法进行优化。GEMM适用于批量推理和训练场景，
+支持梯度计算，是AWQ中功能最全面的量化线性层实现。
 
+核心特性：
+- 4位权重量化，节省75%内存
+- 支持大批量处理，优化吞吐量
+- 完整的梯度计算支持，可用于训练
+- 多后端支持：CUDA扩展、Triton内核、朴素实现
+- 智能后端选择机制
+
+适用场景：
+- 大批量推理服务
+- 模型微调和训练
+- 批处理任务
+- 需要梯度计算的场景
+
+后端优先级：
+1. awq_ext CUDA扩展（最高性能）
+2. Triton内核（跨平台支持）
+3. 朴素实现（兼容性最佳）
+"""
+
+# 导入必要的库
+import torch  # PyTorch主库，张量操作和自动微分
+import warnings  # 警告信息处理
+import torch.nn as nn  # PyTorch神经网络模块
+from torch.autograd import Function  # 自定义自动微分函数
+from awq.utils.module import try_import  # 动态导入扩展模块
+from awq.utils.utils import get_best_device  # 获取最佳计算设备
+from awq.utils.packing_utils import dequantize_gemm  # 朴素反量化实现
+
+# ==================== 扩展模块导入 ====================
+# 注意：我们检查awq_ext或triton是否可用。如果两者都安装，优先使用awq_ext。
+
+# 尝试导入AWQ CUDA扩展模块
 awq_ext, msg = try_import("awq_ext")
-user_has_been_warned = False
+user_has_been_warned = False  # 用于防止重复警告
 
+# 尝试导入Triton内核
 try:
     from awq.modules.triton.gemm import awq_gemm_triton, awq_dequantize_triton
-
-    # covers CUDA, ROCm and XPU. If we can import triton, then we can use it.
+    # Triton支持CUDA、ROCm和XPU。如果能导入triton，就可以使用它。
     TRITON_AVAILABLE = True
-
 except ImportError:
     TRITON_AVAILABLE = False
 
-# Adapted from https://github.com/compressa-ai/AutoAWQ/tree/dev
+# 改编自 https://github.com/compressa-ai/AutoAWQ/tree/dev
 class WQLinearMMFunction(Function):
+    """
+    GEMM量化线性层的自动微分函数
+
+    该类实现了支持梯度的量化矩阵乘法，是GEMM版本的核心。
+    它继承了PyTorch的Function类，自定义了前向和反向传播逻辑，
+    使得量化层能够参与训练过程。
+
+    特性：
+        - 支持前向传播的多种后端
+        - 完整的梯度计算实现
+        - 智能后端选择策略
+        - 内存优化的计算流程
+
+    后端选择逻辑：
+        1. 优先使用awq_ext CUDA扩展（最高性能）
+        2. 其次使用Triton内核（跨平台支持）
+        3. 最后使用朴素实现（兼容性）
+
+    性能启发式：
+        - 大矩阵使用反量化+matmul策略
+        - 小矩阵使用专用量化内核
+    """
+
     @staticmethod
-    # ctx is the first argument to forward
     def forward(
         ctx,
         x,
@@ -35,51 +85,95 @@ class WQLinearMMFunction(Function):
         bias=None,
         out_features=0,
     ):
-        # The forward pass can use ctx.
+        """
+        前向传播实现
+
+        执行量化矩阵-矩阵乘法，支持多种计算后端和性能优化策略。
+        根据输入大小智能选择最优的计算方式。
+
+        Args:
+            ctx: 自动微分上下文，用于保存反向传播所需信息
+            x (torch.Tensor): 输入张量
+            qweight (torch.Tensor): 量化权重
+            qzeros (torch.Tensor): 量化零点
+            scales (torch.Tensor): 缩放因子
+            w_bit (int): 量化位数，默认4
+            group_size (int): 分组大小，默认128
+            bias (torch.Tensor): 可选偏置
+            out_features (int): 输出特征维度
+
+        Returns:
+            torch.Tensor: 量化线性变换的结果
+
+        计算策略：
+            - 大矩阵 (>1024元素): 反量化 + torch.matmul
+            - 小矩阵 (≤1024元素): 专用量化内核
+        """
+        # 前向传播可以使用ctx保存反向传播需要的信息
         ctx.save_for_backward(x, qweight, qzeros, scales, bias)
         ctx.out_features = out_features
 
+        # 计算输出形状
         out_shape = x.shape[:-1] + (out_features,)
+        # 确保输入为FP16格式
         x = x.to(torch.float16)
+
+        # 处理空输入的特殊情况
         if x.shape[0] == 0:
             return torch.zeros(out_shape, dtype=x.dtype, device=x.device)
 
+        # ==================== 多后端计算策略 ====================
+
+        # 策略1：使用AWQ CUDA扩展（最高性能）
         if awq_ext is not None:
+            # FP16矩阵乘法的启发式条件：矩阵元素数 >= 1024
             FP16_MATMUL_HEURISTIC_CONDITION = x.shape[0] * x.shape[1] >= 1024
 
             if FP16_MATMUL_HEURISTIC_CONDITION:
+                # 大矩阵：反量化 + 标准矩阵乘法
+                # 反量化权重回FP16格式
                 out = awq_ext.dequantize_weights_cuda(
                     qweight, scales, qzeros, 0, 0, 0, False
                 )
+                # 使用cuBLAS优化的矩阵乘法
                 out = torch.matmul(x, out)
             else:
+                # 小矩阵：使用专用的量化GEMM内核
                 out = awq_ext.gemm_forward_cuda(
                     x.reshape(-1, x.shape[-1]), qweight, scales, qzeros, 8
                 )
 
+        # 策略2：使用Triton内核（跨平台支持）
         elif TRITON_AVAILABLE:
             FP16_MATMUL_HEURISTIC_CONDITION = x.shape[0] * x.shape[1] >= 1024
 
             if FP16_MATMUL_HEURISTIC_CONDITION:
+                # 大矩阵：Triton反量化 + PyTorch矩阵乘法
                 out = awq_dequantize_triton(qweight, scales, qzeros)
                 out = torch.matmul(x, out.to(x.dtype))
             else:
+                # 小矩阵：Triton专用量化内核
                 out = awq_gemm_triton(
                     x.reshape(-1, x.shape[-1]), qweight, scales, qzeros, split_k_iters=8,
                 )
 
+        # 策略3：朴素实现（兼容性最佳，但性能较慢）
         else:
             global user_has_been_warned
             if not user_has_been_warned:
-                warnings.warn("Using naive (slow) implementation." + msg)
+                warnings.warn("使用朴素（慢速）实现。" + msg)
                 user_has_been_warned = True
+            # 完全在Python中执行反量化和矩阵乘法
             out = dequantize_gemm(qweight, qzeros, scales, w_bit, group_size)
             out = torch.matmul(x, out)
 
+        # ==================== 后处理 ====================
+        # 添加偏置
         out = out + bias if bias is not None else out
+        # 恢复输出形状
         out = out.reshape(out_shape)
 
-        # always want 3D tensor if tensor is 2D
+        # 确保输出始终是3D张量（如果输入是2D则添加batch维度）
         if len(out.shape) == 2:
             out = out.unsqueeze(0)
 
@@ -87,14 +181,41 @@ class WQLinearMMFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """
+        反向传播实现
+
+        计算量化线性层的梯度，支持权重共享机制。
+        由于权重是量化的，梯度只传播到输入，权重参数通过其他方式更新。
+
+        Args:
+            ctx: 前向传播保存的上下文信息
+            grad_output (torch.Tensor): 输出梯度
+
+        Returns:
+            tuple: (输入梯度, 权重梯度, 零点梯度, 缩放因子梯度, ...)
+                  只有输入需要梯度，其他参数返回None
+
+        梯度计算：
+            - 反量化权重到原始精度
+            - 计算输入梯度：grad_input = grad_output × weight^T
+            - 使用批处理矩阵乘法优化性能
+
+        注意：
+            量化参数的更新通常通过量化感知训练(QAT)或
+            其他专门的量化优化方法处理，不通过标准反向传播。
+        """
+        # 从上下文中恢复前向传播保存的张量
         input, qweight, qzeros, scales, bias = ctx.saved_tensors
 
+        # 检查是否有可用的加速后端
         if awq_ext is None and not TRITON_AVAILABLE:
             raise ValueError(
-                "either triton or autoawq-kernels is needed to be installed to use `.backward()`. Make sure to install the auto-awq kernels"
-                " by following the installation guides in https://github.com/casper-hansen/AutoAWQ_kernels"
+                "需要安装triton或autoawq-kernels才能使用`.backward()`。请按照安装指南安装："
+                "https://github.com/casper-hansen/AutoAWQ_kernels"
             )
-        
+
+        # ==================== 梯度计算 ====================
+        # 将权重反量化回原始精度用于梯度计算
         # Cast to correct dtype for mixed precision training
         if awq_ext is not None:
             weights = awq_ext.dequantize_weights_cuda(
@@ -105,41 +226,100 @@ class WQLinearMMFunction(Function):
                 qweight, scales, qzeros
             ).to(grad_output.dtype)
 
+        # 计算输入梯度（如果需要）
         if ctx.needs_input_grad[0]:
-            # 3D matmul using torch.bmm: https://pytorch.org/docs/stable/generated/torch.bmm.html#torch.bmm
-            # to propagate gradient across all batch sizes.
+            # 3D矩阵乘法使用torch.bmm：https://pytorch.org/docs/stable/generated/torch.bmm.html
+            # 在所有批量大小上传播梯度
             batch_size = grad_output.shape[0]
+            # grad_input = grad_output × weights^T
             grad_input = grad_output.bmm(weights.transpose(0, 1).unsqueeze(0).repeat(batch_size, 1, 1))
 
+        # 返回梯度：只有输入需要梯度，其他参数返回None
         return grad_input, None, None, None, None, None, None, None
 
-class WQLinear_GEMM(nn.Module):
+    class WQLinear_GEMM(nn.Module):
+    """
+    AWQ GEMM量化线性层类
+
+    该类实现了基于GEMM的AWQ量化线性变换，专门为大批量矩阵-矩阵乘法优化。
+    与GEMV版本不同，GEMM版本支持梯度计算，可以用于训练场景。
+
+    Attributes:
+        in_features (int): 输入特征维度
+        out_features (int): 输出特征维度
+        w_bit (int): 量化位数，当前仅支持4位
+        group_size (int): 量化分组大小
+        training (bool): 是否处于训练模式
+        qweight (torch.Tensor): 量化后的权重张量
+        qzeros (torch.Tensor): 量化后的零点张量
+        scales (torch.Tensor): 缩放因子张量
+        bias (torch.Tensor): 可选的偏置张量
+
+    与GEMV的区别：
+        - 支持梯度计算和训练
+        - 权重布局不同：转置形式以优化批处理
+        - 多后端支持：CUDA扩展、Triton、朴素实现
+        - 吞吐量优化而非延迟优化
+
+    适用场景：
+        - 大批量推理
+        - 模型微调训练
+        - 批处理服务
+        - 量化感知训练
+    """
+
     def __init__(
         self, w_bit, group_size, in_features, out_features, bias, dev, training=False
     ):
+        """
+        初始化GEMM量化线性层
+
+        Args:
+            w_bit (int): 量化位数，当前仅支持4位
+            group_size (int): 量化分组大小，-1表示按通道量化
+            in_features (int): 输入特征维度
+            out_features (int): 输出特征维度
+            bias (bool): 是否使用偏置
+            dev (str): 设备类型（'cpu'或'cuda'）
+            training (bool): 是否启用训练模式，支持梯度计算
+
+        Raises:
+            NotImplementedError: 当w_bit不是4时抛出异常
+
+        设计考虑：
+            - 训练模式支持梯度计算
+            - 权重布局针对批处理优化
+            - 多设备兼容性
+        """
         super().__init__()
 
+        # 目前仅支持4位量化
         if w_bit not in [4]:
-            raise NotImplementedError("Only 4-bit are supported for now.")
+            raise NotImplementedError("目前仅支持4位量化。")
 
-        self.in_features = in_features
-        self.out_features = out_features
-        self.w_bit = w_bit
+        # 基本属性设置
+        self.in_features = in_features      # 输入维度
+        self.out_features = out_features    # 输出维度
+        self.w_bit = w_bit                  # 量化位数
         self.group_size = group_size if group_size != -1 else in_features
-        self.training = training
+        self.training = training            # 训练模式标志
 
-        # quick sanity check (make sure aligment)
-        assert self.in_features % self.group_size == 0
-        assert out_features % (32 // self.w_bit) == 0
+        # ==================== 内存对齐检查 ====================
+        assert self.in_features % self.group_size == 0, "输入特征必须能被分组大小整除"
+        assert out_features % (32 // self.w_bit) == 0, "输出特征必须能被打包单位整除"
 
+        # ==================== 初始化量化参数缓冲区 ====================
+        # GEMM的权重布局：转置形式 [in_features, out_features//8] 优化批处理
         self.register_buffer(
             "qweight",
             torch.zeros(
-                (in_features, out_features // (32 // self.w_bit)),
+                (in_features, out_features // (32 // self.w_bit)),  # 转置布局
                 dtype=torch.int32,
                 device=dev,
             ),
         )
+
+        # 零点布局：[group_count, out_features//8]
         self.register_buffer(
             "qzeros",
             torch.zeros(
@@ -148,6 +328,8 @@ class WQLinear_GEMM(nn.Module):
                 device=dev,
             ),
         )
+
+        # 缩放因子布局：[group_count, out_features]
         self.register_buffer(
             "scales",
             torch.zeros(
@@ -156,14 +338,12 @@ class WQLinear_GEMM(nn.Module):
                 device=dev,
             ),
         )
+
+        # 可选偏置
         if bias:
             self.register_buffer(
                 "bias",
-                torch.zeros(
-                    (out_features),
-                    dtype=torch.float16,
-                    device=dev,
-                ),
+                torch.zeros((out_features), dtype=torch.float16, device=dev),
             )
         else:
             self.bias = None
@@ -172,6 +352,9 @@ class WQLinear_GEMM(nn.Module):
     def from_linear(
         cls, linear, w_bit, group_size, init_only=False, scales=None, zeros=None
     ):
+        """
+        从标准线性层创建GEMM量化线性层
+        """
         awq_linear = cls(
             w_bit,
             group_size,
@@ -251,48 +434,53 @@ class WQLinear_GEMM(nn.Module):
         return awq_linear
 
     def forward(self, x):
+        """
+        GEMM量化线性层的前向传播
+
+        支持训练和推理两种模式，通过自定义Function实现。
+        训练模式支持梯度计算，推理模式禁用梯度以提高性能。
+
+        Args:
+            x (torch.Tensor): 输入张量，形状为[*, in_features]
+
+        Returns:
+            torch.Tensor: 输出张量，形状为[*, out_features]
+        """
         out_shape = x.shape[:-1] + (self.out_features,)
 
+        # 数据类型处理
         input_dtype = x.dtype
         if input_dtype != torch.float16:
             x = x.half()
 
+        # 根据训练模式选择梯度计算方式
         if self.training:
+            # 训练模式：启用梯度计算
             out = WQLinearMMFunction.apply(
-                x,
-                self.qweight,
-                self.qzeros,
-                self.scales,
-                self.w_bit,
-                self.group_size,
-                self.bias,
-                self.out_features,
+                x, self.qweight, self.qzeros, self.scales,
+                self.w_bit, self.group_size, self.bias, self.out_features,
             )
         else:
+            # 推理模式：禁用梯度以提高性能
             with torch.no_grad():
                 out = WQLinearMMFunction.apply(
-                    x,
-                    self.qweight,
-                    self.qzeros,
-                    self.scales,
-                    self.w_bit,
-                    self.group_size,
-                    self.bias,
-                    self.out_features,
+                    x, self.qweight, self.qzeros, self.scales,
+                    self.w_bit, self.group_size, self.bias, self.out_features,
                 )
 
+        # 恢复数据类型
         if input_dtype != torch.float16:
             out = out.to(dtype=input_dtype)
 
         return out.reshape(out_shape)
 
     def extra_repr(self) -> str:
+        """
+        返回模块的字符串表示
+        """
         return (
             "in_features={}, out_features={}, bias={}, w_bit={}, group_size={}".format(
-                self.in_features,
-                self.out_features,
-                self.bias is not None,
-                self.w_bit,
-                self.group_size,
+                self.in_features, self.out_features, self.bias is not None,
+                self.w_bit, self.group_size,
             )
         )
