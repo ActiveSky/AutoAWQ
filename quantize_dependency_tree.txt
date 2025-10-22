@@ -1,0 +1,159 @@
+====================================
+AWQ Quantize 模块依赖关系图
+====================================
+
+┌─awq/quantize/ [根目录]
+│
+├── __init__.py [空文件 - 无导出]
+│
+├── quantizer.py [主量化文件]
+│   ├─ 主要类：
+│   │   └─ AwqQuantizer [核心量化器类]
+│   │      ├─ __init__() [初始化量化器]
+│   │      ├─ init_quant() [初始化量化过程]
+│   │      │   └─ 内嵌类: Catcher [捕获输入的钩子类]
+│   │      │      ├─ __init__()
+│   │      │      └─ forward() [捕获输入/参数]
+│   │      ├─ quantize() [核心量化方法] ⭐
+│   │      │   ├─ ├── _get_input_feat [获取输入特征]
+│   │      │   │   ├─ 内嵌函数: cache_input_hook [缓存输入钩子]
+│   │      │   │   └─ 内嵌函数: cat_and_assert [拼接验证函数]
+│   │      │   ├─ ├── _search_best_scale [搜索最佳缩放]
+│   │      │   │   ├─ ├── _compute_best_scale [计算最佳缩放]
+│   │      │   │   │   └─ └── _compute_loss [计算量化损失]
+│   │      │   │   └─ ├── _module_forward [模块前向传播]
+│   │      │   ├─ ├── _search_best_clip [搜索最佳裁剪]
+│   │      │   │   └─ └── _compute_best_clip [计算最佳裁剪]
+│   │      │   └─ ├── _apply_quant [应用量化]
+│   │      ├─ pack() [打包量化权重]
+│   │      │   └─ ├── _apply_quant [应用量化]
+│   │      ├─ pseudo_quantize_tensor() [伪量化张量]
+│   │      ├─ pseudo_dequantize_tensor() [**未使用**]
+│   │      └─ _sanitize_kwargs() [清理参数]
+│   │
+│   ├─ 外部依赖调用关系：
+│   │   ├─ awq.quantize.scale
+│   │   │   ├─ apply_scale [应用缩放因子]
+│   │   │   └─ apply_clip [应用权重裁剪]
+│   │   ├─ awq.utils.calib_data
+│   │   │   └─ get_calib_dataset [获取校准数据]
+│   │   ├─ awq.modules.linear
+│   │   │   ├─ WQLinear_GEMM [GEMM量化线性层]
+│   │   │   ├─ WQLinear_GEMV [GEMV量化线性层]
+│   │   │   ├─ WQLinear_Marlin [Marlin量化线性层]
+│   │   │   └─ WQLinear_GEMVFast [快速GEMV量化线性层]
+│   │   ├─ awq.utils.module
+│   │   │   ├─ append_str_prefix [添加字符串前缀]
+│   │   │   ├─ get_op_name [获取操作名称]
+│   │   │   ├─ get_named_linears [获取命名线性层]
+│   │   │   ├─ set_op_by_name [按名称设置操作]
+│   │   │   └─ exclude_layers_to_not_quantize [排除不需要量化的层]
+│   │   ├─ awq.models.base
+│   │   │   └─ BaseAWQForCausalLM [AWQ模型基类]
+│   │   └─ awq.utils.utils
+│   │      ├─ clear_memory [清理内存]
+│   │      └─ get_best_device [获取最佳设备]
+│   │
+│   └─ 第三方库依赖：
+│      ├─ torch [PyTorch核心库]
+│      ├─ torch.nn [神经网络模块]
+│      ├─ transformers [HuggingFace Transformers]
+│      ├─ tqdm [进度条显示]
+│      ├─ inspect [代码检查模块]
+│      ├─ logging [日志记录]
+│      ├─ functools [函数工具]
+│      ├─ typing [类型注解]
+│      └─ collections.defaultdict [默认字典]
+│
+└── scale.py [缩放和裁剪模块]
+    ├─ apply_clip() [应用权重裁剪]
+    │   └─ 外部调用：get_op_by_name, get_best_device
+    ├─ apply_scale() [应用缩放因子] ⭐
+    │   ├─ 策略分支1: Linear → Linear(s) 调用 scale_fc_fcs
+    │   ├─ 策略分支2: Linear → Linear 调用 scale_fc_fc
+    │   ├─ 策略分支3: Norm → Linear(s) 调用 scale_ln_fcs
+    │   └─ 策略分支4: Activation → Linear 调用 scale_gelu_fc
+    ├─ scale_ln_fcs() [归一化→线性层缩放]
+    │   ├─ 支持的归一化类型: LayerNorm, RMSNorm, CohereLayerNorm
+    │   ├─ 特殊处理: GemmaRMSNorm, Gemma2RMSNorm
+    │   └─ 外部调用: ScaledActivation (针对激活函数)
+    ├─ scale_fc_fc() [线性→线性缩放]
+    ├─ scale_fc_fcs() [线性→多线性缩放]
+    ├─ scale_gelu_fc() [激活→线性缩放]
+    │
+    └─ 外部依赖：
+        ├─ awq.utils.utils: get_best_device
+        ├─ awq.utils.module: get_op_by_name, set_op_by_name
+        ├─ awq.modules.act: ScaledActivation
+        ├─ transformers.models.*: 各种模型特定归一化层
+        ├─ torch: 张量操作
+        └─ torch.nn: 神经网络模块
+
+====================================
+调用流程图 (Call Flow Diagram)
+====================================
+
+量化主流程:
+├─ quantize() ◄───────── 主入口
+│   ├─ _get_input_feat() ── 获取所有层的输入特征
+│   │   └─ 使用前向钩子捕获输入数据
+│   ├─ _search_best_scale() ── 计算最佳缩放因子
+│   │   ├─ _compute_best_scale() ── 网格搜索最优比例
+│   │   │   └─ _compute_loss() ── 计算量化误差
+│   │   └─ apply_scale() ── 应用缩放到层权重
+│   ├─ _search_best_clip() ── 计算最佳裁剪阈值
+│   │   ├─ _compute_best_clip() ── 网格搜索裁剪值
+│   │   └─ apply_clip() ── 应用裁剪到权重
+│   └─ _apply_quant() ── 执行实际权重量化
+
+内存管理流程:
+├─ clear_memory() ── 在关键步骤释放GPU内存
+├─ get_best_device() ── 智能选择CPU/GPU设备
+└─ 设备移动策略 ── 按需在CPU/GPU间移动张量
+
+数据流:
+├─ init_quant() ◄───────── 准备校准数据
+│   ├─ get_calib_dataset() ── 获取量化校准样本
+│   ├─ Catcher类 ── 捕获第一层输入/参数
+│   └─ 返回: modules, kwargs, inputs
+│
+├─ _get_input_feat() ◄──── 输入特征提取
+│   ├─ cache_input_hook ── 注册前向钩子
+│   ├─ _module_forward() ── 执行前向传播触发钩子
+│   └─ cat_and_assert ── 处理并验证特征数据
+│
+└─ quantize()处理各层后:
+    └─ _apply_quant() ── 应用量化替换线性层
+        └─ WQLinear_* 系列 ── 各后端量化实现
+
+====================================
+依赖关系总结 (Dependency Summary)
+====================================
+
+📦 内部函数/类统计:
+├── quantizer.py:
+│   ├── 1个主要类 (AwqQuantizer)
+│   ├── 1个内嵌类 (Catcher)
+│   ├── 2个内嵌函数 (cache_input_hook, cat_and_assert)
+│   ├── 9个主要方法
+│   └── 2个辅助方法
+│
+└── scale.py:
+    ├── 5个核心缩放/裁剪函数
+    └── 无内部类/函数
+
+🔗 外部函数调用统计:
+├── awq内部模块: 12个函数来自5个模块
+├── 第三方库: 8个标准库模块
+├── transformers: 多种模型特定组件
+└── 总调用点: ~50+ 外部依赖
+
+🎯 关键依赖链:
+AwqQuantizer.quantize()
+├── awq.quantize.scale.apply_scale()
+│   └── apply_scale() 内部调用各种scale_*()函数
+├── awq.quantize.scale.apply_clip()
+└── awq.modules.linear.WQLinear_* 量化后端
+    └── 通过 awq.utils.module 管理模块替换
+
+====================================

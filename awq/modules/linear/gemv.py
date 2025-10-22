@@ -206,7 +206,7 @@ class WQLinear_GEMV(nn.Module):
 
     @classmethod
     def from_linear(
-        cls, linear, w_bit, group_size, init_only=False, scales=None, zeros=None
+        cls, linear:nn.Linear, w_bit, group_size, init_only=False, scales=None, zeros=None
     ):
         """
         从标准线性层创建GEMV量化线性层

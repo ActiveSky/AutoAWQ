@@ -10,5 +10,27 @@ e={
     "b":2,
     "c":3
 }
-for i,j in e:
-    print(i)
+# for i,j in e:
+#     print(i)
+
+import torch
+from torch import nn
+
+HIDDEN_SIZE = 256
+
+class MyNet:
+    def __init__(self,in_feature,out_feature):
+        self.up=nn.Linear(in_feature,HIDDEN_SIZE)
+        self.relu=nn.ReLU()
+        self.down=nn.Linear(HIDDEN_SIZE,out_feature)
+    def forward(self,x):
+        x=self.up(x)
+        x=self.relu(x)
+        x=self.down(x)
+        return x
+    
+if __name__ == '__main__':
+    net=MyNet(10,2)
+    # 输出网络结构
+    print(net.up.parameters())
+        

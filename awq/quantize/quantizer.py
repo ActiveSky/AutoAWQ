@@ -164,7 +164,7 @@ class AwqQuantizer:
 
         return w, scales, zeros  # 返回量化权重、缩放因子和零点
 
-    def pseudo_dequantize_tensor(
+    def pseudo_dequantize_tensor( ##没有被使用
         self, w: nn.Linear, scales: torch.Tensor, zeros: Optional[torch.Tensor] = None
     ):
         """
@@ -191,7 +191,7 @@ class AwqQuantizer:
 
         return w  # 返回反量化后的权重
 
-    def quantize(self):
+    def quantize(self):# 核心函数
         """
         执行AWQ量化的主要方法
 
@@ -325,7 +325,7 @@ class AwqQuantizer:
             linear_layer = linear_layer.to(get_best_device()).half()  # 移动到最佳设备并转为半精度
 
             # 对权重进行伪量化
-            linear_layer.weight.data, scales, zeros = self.pseudo_quantize_tensor(
+            linear_layer.weight.data, scales, zeros  = self.pseudo_quantize_tensor(
                 linear_layer.weight.data
             )
 
@@ -383,7 +383,7 @@ class AwqQuantizer:
             # 如果没有设置并行校准样本数，一次性处理所有样本
             module_output = module(x, **module_kwargs)
             if isinstance(module_output, tuple):
-                module_output = module_output[0]  # 如果是元组，取第一个元素
+                module_output = module_output[0]  # 如果是元组，取第一个元素；比如(output, attention_weights, guard_values)
         else:
             # 内存高效地处理所有校准样本，但每次只处理n_parallel_calib_samples个样本
             module_output = []
