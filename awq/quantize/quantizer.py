@@ -329,9 +329,9 @@ class AwqQuantizer:
                 linear_layer.weight.data
             )
 
-            # 根据量化版本选择相应的量化线性层
+            # 根据量化版本选择相应的量化线性层，转置后：(in_features // group_size, out_features)
             if self.version == "gemm":
-                scales = scales.t().contiguous()  # 转置缩放因子
+                scales = scales.t().contiguous()  # 转置缩放因子，
                 if zeros is not None:
                     zeros = zeros.t().contiguous()  # 转置零点
                 q_linear_module = WQLinear_GEMM

@@ -30,7 +30,13 @@ class MyNet:
         return x
     
 if __name__ == '__main__':
-    net=MyNet(10,2)
+    # net=MyNet(10,2)
     # 输出网络结构
-    print(net.up.parameters())
-        
+    # print(net.up.parameters())
+    # a=10
+    # for i in range(30):
+    #     print(i // 10)
+    a=[[1,2,3],
+                        [4,5,6]]
+    a=torch.tensor(a)
+    print(a[0])
